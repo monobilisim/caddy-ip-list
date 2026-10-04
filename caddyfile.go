@@ -47,6 +47,9 @@ type URLIPRange struct {
 	ctx  caddy.Context
 	lock *sync.RWMutex
     log  *zap.Logger
+
+	// Closed by Cleanup to stop the background refresh loop.
+	stop chan struct{}
 }
 
 // CaddyModule returns the Caddy module information.
@@ -241,57 +244,73 @@ func (s *URLIPRange) getPrefixes() ([]netip.Prefix, error) {
 func (s *URLIPRange) Provision(ctx caddy.Context) error {
 	s.ctx = ctx
 	s.lock = new(sync.RWMutex)
-    s.log = ctx.Logger()
+	s.log = ctx.Logger()
+	s.stop = make(chan struct{})
 
-	// Perform initial fetch
-    initialRanges, err := s.getPrefixes()
-    if err != nil {
-        // Attempt to load from cache so we can start even when sources are down
-        cached, cacheErr := s.loadFromCache()
-        if cacheErr != nil {
-            return fmt.Errorf("failed to fetch initial IP ranges and no cache available: fetch error: %v, cache error: %v", err, cacheErr)
-        }
-        s.ranges = cached
-        if s.log != nil {
-            s.log.Warn("using cached IP ranges due to fetch failure on startup", zap.Error(err))
-        }
-    } else {
-        s.ranges = initialRanges
-        if err := s.saveToCache(initialRanges); err != nil && s.log != nil {
-            s.log.Warn("failed to save IP ranges cache", zap.Error(err))
-        }
-    }
+	// No network I/O here: Caddy re-provisions every module on each config
+	// change, so a synchronous fetch directly extends the config load time.
+	// The last known good list is served from the persistent cache.
+	cached, cacheErr := s.loadFromCache()
+	if cacheErr == nil {
+		s.ranges = cached
+	} else if s.log != nil {
+		s.log.Warn("no usable IP range cache; starting with an empty list until the first refresh",
+			zap.Error(cacheErr))
+	}
 
-	// update in background
-	go s.refreshLoop()
+	// Refresh in the background: immediately on a cold start (no cache),
+	// otherwise at the first tick.
+	go s.refreshLoop(cacheErr != nil)
 	return nil
 }
 
-func (s *URLIPRange) refreshLoop() {
-	if s.Interval == 0 {
-		s.Interval = caddy.Duration(time.Hour)
+// Cleanup stops the background refresh loop when this config is unloaded.
+// Without it every config load leaks a goroutine and a ticker, because Caddy
+// never cancels the module context on unload.
+func (s *URLIPRange) Cleanup() error {
+	if s.stop != nil {
+		close(s.stop)
+		s.stop = nil
+	}
+	return nil
+}
+
+func (s *URLIPRange) refresh() {
+	fullPrefixes, err := s.getPrefixes()
+	if err != nil {
+		if s.log != nil {
+			s.log.Warn("failed to refresh IP ranges; keeping existing cache", zap.Error(err))
+		}
+		return
 	}
 
-	ticker := time.NewTicker(time.Duration(s.Interval))
+	s.lock.Lock()
+	s.ranges = fullPrefixes
+	s.lock.Unlock()
+
+	if err := s.saveToCache(fullPrefixes); err != nil && s.log != nil {
+		s.log.Warn("failed to save IP ranges cache after refresh", zap.Error(err))
+	}
+}
+
+func (s *URLIPRange) refreshLoop(refreshNow bool) {
+	interval := time.Hour
+	if s.Interval > 0 {
+		interval = time.Duration(s.Interval)
+	}
+
+	if refreshNow {
+		s.refresh()
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
-			fullPrefixes, err := s.getPrefixes()
-			if err != nil {
-                if s.log != nil {
-                    s.log.Warn("failed to refresh IP ranges; keeping existing cache", zap.Error(err))
-                }
-                break
-			}
-
-			s.lock.Lock()
-			s.ranges = fullPrefixes
-			s.lock.Unlock()
-            if err := s.saveToCache(fullPrefixes); err != nil && s.log != nil {
-                s.log.Warn("failed to save IP ranges cache after refresh", zap.Error(err))
-            }
-		case <-s.ctx.Done():
-			ticker.Stop()
+			s.refresh()
+		case <-s.stop:
 			return
 		}
 	}
@@ -370,6 +389,7 @@ func (m *URLIPRange) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 var (
 	_ caddy.Module            = (*URLIPRange)(nil)
 	_ caddy.Provisioner       = (*URLIPRange)(nil)
+	_ caddy.CleanerUpper      = (*URLIPRange)(nil)
 	_ caddyfile.Unmarshaler   = (*URLIPRange)(nil)
 	_ caddyhttp.IPRangeSource = (*URLIPRange)(nil)
 )

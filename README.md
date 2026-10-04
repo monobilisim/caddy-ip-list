@@ -65,12 +65,19 @@ trusted_proxies list {
 | url        | URL(s) to retrieve the IP list                   | string   | *required* |
 | interval   | Frequency at which the IP list is retrieved      | duration | 1h         |
 | timeout    | Maximum time to wait for a response from the URL | duration | no timeout |
-| retries    | Maximum number of retries per URL on startup     | int      | 2          |
+| retries    | Maximum number of retries per URL per refresh    | int      | 2          |
 | cache_file | Optional path for persistent cache               | string   | auto       |
 
 ## URL Fetching, Caching, and Startup Behavior
 
-- On startup, the module attempts to fetch each configured URL.
-- If fetching fails after `retries`, it will load the last good IP ranges from the persistent cache and continue to start.
-- When refresh attempts fail, the currently loaded ranges remain in use; once a refresh succeeds, the in-memory list and cache are updated.
-- The refresh loop will continue to update the list in the background at the configured `interval`.
+- Provisioning performs **no network I/O**: the last known good ranges are loaded from the persistent
+  cache, so a Caddy config change is never delayed by a slow or unreachable source.
+- On a cold start (no usable cache) the module starts with an empty list and refreshes in the background
+  immediately; otherwise the first refresh happens at `interval`.
+- When refresh attempts fail, the currently loaded ranges remain in use; once a refresh succeeds, the
+  in-memory list and cache are updated.
+- The refresh loop runs in the background and is stopped when the configuration is unloaded, so repeated
+  config loads do not leak goroutines or timers.
+
+> Note: without a usable cache file, IP range matchers see an empty list until the first background refresh
+> completes. Keep the cache on persistent storage (the default under Caddy's data directory does this).
