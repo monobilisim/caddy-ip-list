@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -404,7 +405,7 @@ func TestEmptyRefreshKeepsPreviousList(t *testing.T) {
 	d2 := caddyfile.NewTestDispenser(`
 	list {
 	    file ` + listPath + `
-	    interval 100ms
+	    interval 12h
 	    allow_empty
 	}`)
 	r2 := URLIPRange{CacheFile: filepath.Join(dir, "cache2.json")}
@@ -419,10 +420,16 @@ func TestEmptyRefreshKeepsPreviousList(t *testing.T) {
 	if err := r2.Provision(ctx2); err != nil {
 		t.Fatalf("Provision failed: %v", err)
 	}
-	defer r2.Cleanup()
+	// cold start: the initial refresh runs in the background, wait for it
+	time.Sleep(300 * time.Millisecond)
 	if got := r2.GetIPRanges(nil); len(got) != 0 {
 		t.Errorf("allow_empty should accept the empty list, got %v", got)
 	}
+	if err := r2.Cleanup(); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	// let any in-flight write finish before the temp dir is removed
+	time.Sleep(100 * time.Millisecond)
 }
 
 // TestCachePathIncludesFiles: two blocks with different file sources must not
@@ -450,5 +457,61 @@ func TestCachePathIncludesFiles(t *testing.T) {
 	}
 	if pc == pa {
 		t.Errorf("URL and file source share a cache file: %s", pa)
+	}
+}
+
+// TestConcurrentSaveToCache: several instances share one cache file when they
+// share sources, so concurrent writes must never leave invalid JSON behind.
+func TestConcurrentSaveToCache(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cache.json")
+
+	prefix, err := caddyhttp.CIDRExpressionToPrefix("192.0.2.0/24")
+	if err != nil {
+		t.Fatalf("prefix: %v", err)
+	}
+
+	const writers = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := URLIPRange{CacheFile: path}
+			r.lock = new(sync.RWMutex)
+			for j := 0; j < 25; j++ {
+				if err := r.saveToCache([]netip.Prefix{prefix}); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("saveToCache: %v", err)
+	}
+
+	r := URLIPRange{CacheFile: path}
+	r.lock = new(sync.RWMutex)
+	got, err := r.loadFromCache()
+	if err != nil {
+		t.Fatalf("cache left invalid after concurrent writes: %v", err)
+	}
+	if len(got) != 1 || got[0] != prefix {
+		t.Errorf("unexpected cache contents: %v", got)
+	}
+
+	// no temp files may be left behind
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() != "cache.json" {
+			t.Errorf("leftover file in cache dir: %s", e.Name())
+		}
 	}
 }

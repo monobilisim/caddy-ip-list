@@ -60,6 +60,8 @@ type URLIPRange struct {
 
 	// Closed by Cleanup to stop the background refresh loop.
 	stop chan struct{}
+	// Guards a second Cleanup, which would close an already closed channel.
+	cleanupOnce sync.Once
 }
 
 // CaddyModule returns the Caddy module information.
@@ -244,23 +246,30 @@ func (s *URLIPRange) saveToCache(prefixes []netip.Prefix) error {
         contents.Prefixes = append(contents.Prefixes, p.String())
     }
     // write atomically
-    tmp := path + ".tmp"
-    f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+    // A unique temp name: many instances can share one cache file (same
+    // sources), and a shared temp file would interleave their writes into
+    // invalid JSON, which a later start would decode as "no cache".
+    tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
     if err != nil {
         return err
     }
-    enc := json.NewEncoder(f)
+    tmpName := tmp.Name()
+    defer os.Remove(tmpName)
+
+    if err := tmp.Chmod(0o644); err != nil {
+        tmp.Close()
+        return err
+    }
+    enc := json.NewEncoder(tmp)
     enc.SetIndent("", "  ")
     if err := enc.Encode(&contents); err != nil {
-        f.Close()
-        _ = os.Remove(tmp)
+        tmp.Close()
         return err
     }
-    if err := f.Close(); err != nil {
-        _ = os.Remove(tmp)
+    if err := tmp.Close(); err != nil {
         return err
     }
-    return os.Rename(tmp, path)
+    return os.Rename(tmpName, path)
 }
 
 func (s *URLIPRange) getPrefixes() ([]netip.Prefix, error) {
@@ -288,7 +297,8 @@ func (s *URLIPRange) Provision(ctx caddy.Context) error {
 	s.ctx = ctx
 	s.lock = new(sync.RWMutex)
 	s.log = ctx.Logger()
-	s.stop = make(chan struct{})
+	stop := make(chan struct{})
+	s.stop = stop
 
 	// No network I/O here: Caddy re-provisions every module on each config
 	// change, so a synchronous fetch directly extends the config load time.
@@ -303,7 +313,7 @@ func (s *URLIPRange) Provision(ctx caddy.Context) error {
 
 	// Refresh in the background: immediately on a cold start (no cache),
 	// otherwise at the first tick.
-	go s.refreshLoop(cacheErr != nil)
+	go s.refreshLoop(stop, cacheErr != nil)
 	return nil
 }
 
@@ -311,10 +321,11 @@ func (s *URLIPRange) Provision(ctx caddy.Context) error {
 // Without it every config load leaks a goroutine and a ticker, because Caddy
 // never cancels the module context on unload.
 func (s *URLIPRange) Cleanup() error {
-	if s.stop != nil {
-		close(s.stop)
-		s.stop = nil
-	}
+	s.cleanupOnce.Do(func() {
+		if s.stop != nil {
+			close(s.stop)
+		}
+	})
 	return nil
 }
 
@@ -352,7 +363,7 @@ func (s *URLIPRange) refresh() {
 	}
 }
 
-func (s *URLIPRange) refreshLoop(refreshNow bool) {
+func (s *URLIPRange) refreshLoop(stop <-chan struct{}, refreshNow bool) {
 	interval := time.Hour
 	if s.Interval > 0 {
 		interval = time.Duration(s.Interval)
@@ -369,7 +380,7 @@ func (s *URLIPRange) refreshLoop(refreshNow bool) {
 		select {
 		case <-ticker.C:
 			s.refresh()
-		case <-s.stop:
+		case <-stop:
 			return
 		}
 	}
