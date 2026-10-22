@@ -73,6 +73,27 @@ trusted_proxies list {
 }
 ```
 
+## Reproducing the behaviour difference
+
+`scripts/compare.sh` builds two binaries (the pre-fix reference and the current
+revision) and runs the same scenarios against both, then prints a table:
+
+```bash
+./scripts/compare.sh          # markdown table
+./scripts/compare.sh --json   # machine readable
+```
+
+| scenario | `9336c17` (before) | current |
+|---|---|---|
+| source returns 404, no cache | **config rejected, Caddy does not start** | loads, empty list, recovers |
+| source returns 404, cache present | loads from cache | loads from cache |
+| source returns 200, no cache | loads | loads |
+
+The first row is why a 404 in one list could take the whole GLB down: `Provision`
+returned an error, and Caddy discards the entire config when a module fails to
+provision. Override the revisions with `OLD_REF` / `NEW_REF`, or point at binaries
+you already have with `OLD_BIN` / `NEW_BIN`.
+
 ## Defaults
 
 | Name     | Description                                      | Type     | Default    |
