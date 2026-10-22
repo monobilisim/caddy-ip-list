@@ -62,6 +62,9 @@ type URLIPRange struct {
 	stop chan struct{}
 	// Guards a second Cleanup, which would close an already closed channel.
 	cleanupOnce sync.Once
+	// Fingerprint of the file sources as of the last refresh. A low interval is
+	// cheap only if an unchanged file costs a stat and nothing else.
+	lastFiles string
 }
 
 // CaddyModule returns the Caddy module information.
@@ -329,6 +332,38 @@ func (s *URLIPRange) Cleanup() error {
 	return nil
 }
 
+// fileSourcesChanged reports whether any file source is newer than the last
+// refresh. It costs one stat per file and no parsing, so an interval of a few
+// seconds stays cheap even with many instances sharing the same file.
+func (s *URLIPRange) fileSourcesChanged() bool {
+	if len(s.Paths) == 0 {
+		return true // URL sources: always refresh, the fetch is the point
+	}
+	fp := make([]string, 0, len(s.Paths))
+	for _, p := range s.Paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			// Let the refresh report the error the usual way.
+			return true
+		}
+		fp = append(fp, fmt.Sprintf("%s:%d:%d", p, fi.Size(), fi.ModTime().UnixNano()))
+	}
+	joined := strings.Join(fp, "|")
+	if joined == s.lastFiles {
+		return false
+	}
+	s.lastFiles = joined
+	return true
+}
+
+// refreshIfChanged skips the work when every source is an unchanged file.
+func (s *URLIPRange) refreshIfChanged() {
+	if !s.fileSourcesChanged() {
+		return
+	}
+	s.refresh()
+}
+
 func (s *URLIPRange) refresh() {
 	fullPrefixes, err := s.getPrefixes()
 	if err != nil {
@@ -379,7 +414,7 @@ func (s *URLIPRange) refreshLoop(stop <-chan struct{}, refreshNow bool) {
 	for {
 		select {
 		case <-ticker.C:
-			s.refresh()
+			s.refreshIfChanged()
 		case <-stop:
 			return
 		}

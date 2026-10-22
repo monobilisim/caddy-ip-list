@@ -515,3 +515,73 @@ func TestConcurrentSaveToCache(t *testing.T) {
 		}
 	}
 }
+
+// TestUnchangedFileSkipsParse: with a file source and a short interval, an
+// unchanged file must cost a stat and nothing more, or hundreds of instances
+// sharing one file burn CPU for nothing.
+func TestUnchangedFileSkipsParse(t *testing.T) {
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "list.txt")
+	if err := os.WriteFile(listPath, []byte("192.0.2.0/24\n"), 0o644); err != nil {
+		t.Fatalf("write list: %v", err)
+	}
+
+	d := caddyfile.NewTestDispenser(`
+	list {
+	    file ` + listPath + `
+	    interval 100ms
+	}`)
+	r := URLIPRange{CacheFile: filepath.Join(dir, "cache.json")}
+	if err := r.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	r.lock = new(sync.RWMutex)
+
+	r.refreshIfChanged()
+	if got := r.GetIPRanges(nil); len(got) != 1 {
+		t.Fatalf("expected 1 prefix, got %v", got)
+	}
+
+	// unchanged file: the tick must not touch the list
+	if r.fileSourcesChanged() {
+		t.Error("unchanged file reported as changed")
+	}
+	before := r.GetIPRanges(nil)
+	r.refreshIfChanged()
+	if got := r.GetIPRanges(nil); len(got) != len(before) {
+		t.Errorf("unchanged file changed the list: %v -> %v", before, got)
+	}
+
+	// touching the file must be noticed
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(listPath, []byte("192.0.2.0/24\n198.51.100.0/24\n"), 0o644); err != nil {
+		t.Fatalf("rewrite list: %v", err)
+	}
+	if !r.fileSourcesChanged() {
+		t.Error("modified file not detected")
+	}
+	r.refresh()
+	if got := r.GetIPRanges(nil); len(got) != 2 {
+		t.Errorf("changed file not applied: %v", got)
+	}
+}
+
+// TestURLSourceAlwaysRefreshes: a URL source cannot be stat'ed, so every tick
+// still fetches (the fetch interval is the whole point for remote lists).
+func TestURLSourceAlwaysRefreshes(t *testing.T) {
+	r := URLIPRange{URLs: []string{"https://example.invalid/list.txt"}}
+	r.lock = new(sync.RWMutex)
+	if !r.fileSourcesChanged() {
+		t.Error("URL source must always be considered changed")
+	}
+}
+
+// TestMissingFileStillReported: a stat failure must fall through to the normal
+// path so the error is logged instead of being silently swallowed.
+func TestMissingFileStillReported(t *testing.T) {
+	r := URLIPRange{Paths: []string{filepath.Join(t.TempDir(), "nope.txt")}}
+	r.lock = new(sync.RWMutex)
+	if !r.fileSourcesChanged() {
+		t.Error("missing file must be treated as changed so the error surfaces")
+	}
+}
