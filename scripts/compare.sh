@@ -1,42 +1,42 @@
 #!/usr/bin/env bash
-# Iki caddy binary'sini ayni senaryolarda karsilastirir. Varsayilan olarak
-# caddy-ip-list'in bilinen-iyi (eski) ve mevcut (yeni) surumlerini derler.
+# Runs the same scenarios against two caddy binaries and prints a table.
+# By default it builds the pre-fix reference and the current revision.
 #
-# Kullanim:
-#   ./scripts/compare.sh              # iki surumu derle + kos
-#   ./scripts/compare.sh --json       # JSON cikti
-#   OLD_BIN=... NEW_BIN=... ./scripts/compare.sh   # hazir binary'lerle
+# Usage:
+#   ./scripts/compare.sh              # build both revisions, then run
+#   ./scripts/compare.sh --json       # machine readable output
+#   OLD_BIN=... NEW_BIN=... ./scripts/compare.sh   # use existing binaries
 #
-# Sabitler surum degistikce guncellenir; eski surum "kanitlanmis kotu davranis"
-# referansidir, degistirmeyin.
+# The pins below are updated when the current revision moves. OLD_REF is the
+# reference for the known-bad behaviour; leave it alone.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-OLD_REF=${OLD_REF:-9336c172e0f6}   # Provision senkron fetch; 404 + cache yok = config reddedilir
-NEW_REF=${NEW_REF:-0d8b2ae}          # cache-first + file kaynagi + bos liste korumasi + stat kisa devre
+OLD_REF=${OLD_REF:-9336c172e0f6}   # synchronous fetch in Provision; 404 with no cache = config rejected
+NEW_REF=${NEW_REF:-0d8b2ae}   # cache-first Provision + file source + empty-list guard + stat short-circuit
 JSON=0; [ "${1:-}" = "--json" ] && JSON=1
 
 build() { # $1=ref $2=output
   local ref=$1 out=$2
   [ -x "$out" ] && return 0
-  echo "derleniyor: $ref -> $(basename "$out")" >&2
+  echo "building: $ref -> $(basename "$out")" >&2
   XCADDY=$(command -v xcaddy 2>/dev/null || echo "$HOME/go/bin/xcaddy")
   "$XCADDY" build v2.11.2 \
     --with "github.com/monobilisim/caddy-ip-list@$ref" \
     --with github.com/tuzzmaniandevil/caddy-dynamic-clientip@v1.0.4 \
-    --output "$out" >/dev/null 2>&1 || { echo "derleme basarisiz: $ref" >&2; return 1; }
+    --output "$out" >/dev/null 2>&1 || { echo "build failed: $ref" >&2; return 1; }
 }
 
 BUILDDIR=$(mktemp -d /tmp/iplist-bin.XXXXXX)
 OLD=${OLD_BIN:-$BUILDDIR/caddy-old}
 NEW=${NEW_BIN:-$BUILDDIR/caddy-new}
 if [ -z "${OLD_BIN:-}" ] || [ -z "${NEW_BIN:-}" ]; then
-  command -v xcaddy >/dev/null 2>&1 || [ -x "$HOME/go/bin/xcaddy" ] || { echo "xcaddy gerekli (go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest)" >&2; exit 1; }
+  command -v xcaddy >/dev/null 2>&1 || [ -x "$HOME/go/bin/xcaddy" ] || { echo "xcaddy is required (go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest)" >&2; exit 1; }
   build "$OLD_REF" "$OLD" || exit 1
   build "$NEW_REF" "$NEW" || exit 1
 fi
 
 WORK=$(mktemp -d /tmp/iplist-e2e.XXXXXX)
-BASE=$(( 20000 + RANDOM % 20000 ))   # rastgele taban: bayat sureclerin portlarini kullanmayalim
+BASE=$(( 20000 + RANDOM % 20000 ))   # random base: avoid ports still held by a stale process
 N=0
 declare -a ROWS
 PIDS=()
@@ -47,7 +47,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-write_src() { # $1=port $2=mode-file
+write_src() { # $1=port $2=mode-file ("404" or "200")
   cat > "$WORK/src-$1.py" <<PY
 import http.server, socketserver
 class H(http.server.BaseHTTPRequestHandler):
@@ -64,7 +64,7 @@ socketserver.ThreadingTCPServer(("127.0.0.1", $1), H).serve_forever()
 PY
 }
 
-wait_admin() { # $1=admin port; 0 = config yuklendi
+wait_admin() { # $1=admin port; 0 = config accepted
   for _ in $(seq 1 100); do
     curl -sf -o /dev/null -m 1 "localhost:$1/config/" 2>/dev/null && return 0
     sleep 0.2
@@ -72,7 +72,7 @@ wait_admin() { # $1=admin port; 0 = config yuklendi
   return 1
 }
 
-run_case() { # $1=etiket $2=binary $3=404|200 $4=cache 1|0
+run_case() { # $1=label $2=binary $3=404|200 $4=with_cache 1|0
   local label=$1 bin=$2 srcmode=$3 with_cache=$4
   N=$((N+1))
   local sport=$((BASE + N*10)) admin=$((BASE + N*10 + 3)) http=$((BASE + N*10 + 5))
@@ -119,7 +119,7 @@ EOF
   local code="-"
   [ "$up" = "1" ] && code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Host: t.test' "http://127.0.0.1:$http/")
 
-  # 404 -> 200: kaynagi duzelt, servisin toparlanmasini olc
+  # 404 -> 200: fix the source, measure how long the instance takes to recover
   local recover="-"
   if [ "$srcmode" = "404" ] && [ "$up" = "1" ]; then
     echo 200 > "$mode"
@@ -132,10 +132,10 @@ EOF
   fi
 
   local err=""; [ "$up" = "0" ] && err=$(grep -oE "failed to fetch initial IP ranges[^\"]{0,60}" "$dir/run.log" | head -1)
-  [ "$up" = "0" ] && [ -z "$err" ] && err="(config yuklenmedi)"
+  [ "$up" = "0" ] && [ -z "$err" ] && err="(config was not loaded)"
 
-  local cachesz="yok"
-  [ -f "$cache" ] && cachesz=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))['prefixes']))" "$cache" 2>/dev/null || echo "bozuk")
+  local cachesz="none"
+  [ -f "$cache" ] && cachesz=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))['prefixes']))" "$cache" 2>/dev/null || echo "corrupt")
 
   kill -9 "$cpid" >/dev/null 2>&1
   wait "$cpid" 2>/dev/null
@@ -145,14 +145,14 @@ EOF
     "$label" "$up" "$code" "$recover" "$cachesz" "${err:0:45}" >&2
 }
 
-echo "== eski: $("$OLD" build-info 2>/dev/null | awk -F'\t' '/^dep\tgithub.com\/monobilisim/{print $3}')" >&2
-echo "== yeni: $("$NEW" build-info 2>/dev/null | awk -F'\t' '/^dep\tgithub.com\/monobilisim/{print $3}')" >&2
-run_case "eski-404-cache-yok" "$OLD" 404 0
-run_case "eski-404-cache-var" "$OLD" 404 1
-run_case "eski-200-cache-yok" "$OLD" 200 0
-run_case "yeni-404-cache-yok" "$NEW" 404 0
-run_case "yeni-404-cache-var" "$NEW" 404 1
-run_case "yeni-200-cache-yok" "$NEW" 200 0
+echo "== before: $("$OLD" build-info 2>/dev/null | awk -F'\t' '/^dep\tgithub.com\/monobilisim/{print $3}')" >&2
+echo "== after:  $("$NEW" build-info 2>/dev/null | awk -F'\t' '/^dep\tgithub.com\/monobilisim/{print $3}')" >&2
+run_case "before-404-no-cache" "$OLD" 404 0
+run_case "before-404-with-cache" "$OLD" 404 1
+run_case "before-200-no-cache" "$OLD" 200 0
+run_case "after-404-no-cache" "$NEW" 404 0
+run_case "after-404-with-cache" "$NEW" 404 1
+run_case "after-200-no-cache" "$NEW" 200 0
 
 if [ "$JSON" = "1" ]; then
   printf '['
@@ -167,11 +167,11 @@ if [ "$JSON" = "1" ]; then
   printf ']\n'
 else
   echo
-  echo "| senaryo | config yüklendi | HTTP | 404→200 toparlanma | cache prefix | hata |"
+  echo "| scenario | config loaded | HTTP | 404->200 recovery | cache prefixes | error |"
   echo "|---|---|---|---|---|---|"
   for r in "${ROWS[@]}"; do
     IFS='|' read -r l u c rec ca e <<< "$r"
-    loaded=$([ "$u" = "1" ] && echo "evet" || echo "**HAYIR**")
+    loaded=$([ "$u" = "1" ] && echo "yes" || echo "**NO**")
     printf '| `%s` | %s | %s | %s | %s | %s |\n' "$l" "$loaded" "$c" "$rec" "$ca" "${e:0:45}"
   done
 fi
