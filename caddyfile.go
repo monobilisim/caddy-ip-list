@@ -3,15 +3,15 @@ package caddy_ip_list
 import (
 	"bufio"
 	"context"
-    "crypto/sha256"
-    "encoding/hex"
-    "encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
-    "os"
-    "path/filepath"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +19,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-    "go.uber.org/zap"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -36,15 +36,15 @@ type URLIPRange struct {
 	Paths []string `json:"file"`
 	// refresh Interval
 	Interval caddy.Duration `json:"interval,omitempty"`
-    // request Timeout
+	// request Timeout
 	Timeout caddy.Duration `json:"timeout,omitempty"`
-    // Number of retries for fetching the IP list.
-    // Default is 2 when unspecified. Set explicitly to 0 to disable retries.
-    Retries *int `json:"retries,omitempty"`
+	// Number of retries for fetching the IP list.
+	// Default is 2 when unspecified. Set explicitly to 0 to disable retries.
+	Retries *int `json:"retries,omitempty"`
 
-    // Optional path to a cache file. If not set, a file under Caddy's data
-    // directory will be used, derived from the URLs.
-    CacheFile string `json:"cache_file,omitempty"`
+	// Optional path to a cache file. If not set, a file under Caddy's data
+	// directory will be used, derived from the URLs.
+	CacheFile string `json:"cache_file,omitempty"`
 
 	// AllowEmpty lets a refresh that yields no prefixes replace a non-empty
 	// list. Leave it off: an empty list makes `not dynamic_client_ip` match
@@ -56,7 +56,7 @@ type URLIPRange struct {
 
 	ctx  caddy.Context
 	lock *sync.RWMutex
-    log  *zap.Logger
+	log  *zap.Logger
 
 	// Closed by Cleanup to stop the background refresh loop.
 	stop chan struct{}
@@ -118,52 +118,52 @@ func parsePrefixes(r io.Reader) ([]netip.Prefix, error) {
 }
 
 func (s *URLIPRange) fetch(api string) ([]netip.Prefix, error) {
-    retries := 2
-    if s.Retries != nil {
-        retries = *s.Retries
-        if retries < 0 {
-            retries = 0
-        }
-    }
+	retries := 2
+	if s.Retries != nil {
+		retries = *s.Retries
+		if retries < 0 {
+			retries = 0
+		}
+	}
 	var lastErr error
-    for attempt := 0; attempt <= retries; attempt++ {
-        ctx, cancel := s.getContext()
+	for attempt := 0; attempt <= retries; attempt++ {
+		ctx, cancel := s.getContext()
 
-        req, err := http.NewRequestWithContext(ctx, http.MethodGet, api, nil)
-        if err != nil {
-            lastErr = err
-            cancel()
-            break
-        }
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, api, nil)
+		if err != nil {
+			lastErr = err
+			cancel()
+			break
+		}
 
-        resp, err := http.DefaultClient.Do(req)
-        if err != nil {
-            lastErr = err
-            cancel()
-        } else {
-            if resp.StatusCode < 200 || resp.StatusCode > 299 {
-                // drain and close body before next attempt
-                _ = resp.Body.Close()
-                lastErr = fmt.Errorf("fetch %s returned HTTP %d", api, resp.StatusCode)
-                cancel()
-            } else {
-                prefixes, parseErr := parsePrefixes(resp.Body)
-                _ = resp.Body.Close()
-                cancel()
-                if parseErr != nil {
-                    return nil, parseErr
-                }
-                return prefixes, nil
-            }
-        }
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			cancel()
+		} else {
+			if resp.StatusCode < 200 || resp.StatusCode > 299 {
+				// drain and close body before next attempt
+				_ = resp.Body.Close()
+				lastErr = fmt.Errorf("fetch %s returned HTTP %d", api, resp.StatusCode)
+				cancel()
+			} else {
+				prefixes, parseErr := parsePrefixes(resp.Body)
+				_ = resp.Body.Close()
+				cancel()
+				if parseErr != nil {
+					return nil, parseErr
+				}
+				return prefixes, nil
+			}
+		}
 
-        // If not last attempt, delay before retrying
-        if attempt < retries {
+		// If not last attempt, delay before retrying
+		if attempt < retries {
 			time.Sleep(1 * time.Second)
 		}
 	}
 	// After all attempts
-    return nil, fmt.Errorf("after %d retries: %w", retries, lastErr)
+	return nil, fmt.Errorf("after %d retries: %w", retries, lastErr)
 }
 
 // readFile reads a local list. There is no retry: a missing or unreadable file
@@ -182,97 +182,97 @@ func (s *URLIPRange) readFile(path string) ([]netip.Prefix, error) {
 }
 
 type cacheFileContents struct {
-    Prefixes  []string  `json:"prefixes"`
-    UpdatedAt time.Time `json:"updated_at"`
+	Prefixes  []string  `json:"prefixes"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (s *URLIPRange) cachePath() (string, error) {
-    if s.CacheFile != "" {
-        return s.CacheFile, nil
-    }
-    // Derive from every source, so two blocks with different lists never share
-    // a cache file. The "file:" tag keeps paths from colliding with URLs.
-    sources := make([]string, 0, len(s.URLs)+len(s.Paths))
-    sources = append(sources, s.URLs...)
-    for _, p := range s.Paths {
-        sources = append(sources, "file:"+p)
-    }
-    joined := strings.Join(sources, "|")
-    sum := sha256.Sum256([]byte(joined))
-    name := "ip-list-cache-" + hex.EncodeToString(sum[:]) + ".json"
-    dir := caddy.AppDataDir()
-    if dir == "" {
-        // fallback to current working directory
-        dir = "."
-    }
-    return filepath.Join(dir, name), nil
+	if s.CacheFile != "" {
+		return s.CacheFile, nil
+	}
+	// Derive from every source, so two blocks with different lists never share
+	// a cache file. The "file:" tag keeps paths from colliding with URLs.
+	sources := make([]string, 0, len(s.URLs)+len(s.Paths))
+	sources = append(sources, s.URLs...)
+	for _, p := range s.Paths {
+		sources = append(sources, "file:"+p)
+	}
+	joined := strings.Join(sources, "|")
+	sum := sha256.Sum256([]byte(joined))
+	name := "ip-list-cache-" + hex.EncodeToString(sum[:]) + ".json"
+	dir := caddy.AppDataDir()
+	if dir == "" {
+		// fallback to current working directory
+		dir = "."
+	}
+	return filepath.Join(dir, name), nil
 }
 
 func (s *URLIPRange) loadFromCache() ([]netip.Prefix, error) {
-    path, err := s.cachePath()
-    if err != nil {
-        return nil, err
-    }
-    f, err := os.Open(path)
-    if err != nil {
-        return nil, err
-    }
-    defer f.Close()
-    var contents cacheFileContents
-    if err := json.NewDecoder(f).Decode(&contents); err != nil {
-        return nil, err
-    }
-    prefixes := make([]netip.Prefix, 0, len(contents.Prefixes))
-    for _, p := range contents.Prefixes {
-        prefix, err := caddyhttp.CIDRExpressionToPrefix(p)
-        if err != nil {
-            return nil, fmt.Errorf("invalid prefix in cache %q: %w", p, err)
-        }
-        prefixes = append(prefixes, prefix)
-    }
-    return prefixes, nil
+	path, err := s.cachePath()
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var contents cacheFileContents
+	if err := json.NewDecoder(f).Decode(&contents); err != nil {
+		return nil, err
+	}
+	prefixes := make([]netip.Prefix, 0, len(contents.Prefixes))
+	for _, p := range contents.Prefixes {
+		prefix, err := caddyhttp.CIDRExpressionToPrefix(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid prefix in cache %q: %w", p, err)
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
 }
 
 func (s *URLIPRange) saveToCache(prefixes []netip.Prefix) error {
-    path, err := s.cachePath()
-    if err != nil {
-        return err
-    }
-    // ensure directory exists
-    if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-        return err
-    }
-    // prepare contents
-    contents := cacheFileContents{UpdatedAt: time.Now()}
-    contents.Prefixes = make([]string, 0, len(prefixes))
-    for _, p := range prefixes {
-        contents.Prefixes = append(contents.Prefixes, p.String())
-    }
-    // write atomically
-    // A unique temp name: many instances can share one cache file (same
-    // sources), and a shared temp file would interleave their writes into
-    // invalid JSON, which a later start would decode as "no cache".
-    tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
-    if err != nil {
-        return err
-    }
-    tmpName := tmp.Name()
-    defer os.Remove(tmpName)
+	path, err := s.cachePath()
+	if err != nil {
+		return err
+	}
+	// ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	// prepare contents
+	contents := cacheFileContents{UpdatedAt: time.Now()}
+	contents.Prefixes = make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		contents.Prefixes = append(contents.Prefixes, p.String())
+	}
+	// write atomically
+	// A unique temp name: many instances can share one cache file (same
+	// sources), and a shared temp file would interleave their writes into
+	// invalid JSON, which a later start would decode as "no cache".
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
 
-    if err := tmp.Chmod(0o644); err != nil {
-        tmp.Close()
-        return err
-    }
-    enc := json.NewEncoder(tmp)
-    enc.SetIndent("", "  ")
-    if err := enc.Encode(&contents); err != nil {
-        tmp.Close()
-        return err
-    }
-    if err := tmp.Close(); err != nil {
-        return err
-    }
-    return os.Rename(tmpName, path)
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(&contents); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func (s *URLIPRange) getPrefixes() ([]netip.Prefix, error) {
@@ -471,12 +471,12 @@ func (m *URLIPRange) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err != nil || n < 0 {
 				return fmt.Errorf("invalid retries value: %s", d.Val())
 			}
-            m.Retries = &n
-        case "cache_file":
-            if !d.NextArg() {
-                return d.ArgErr()
-            }
-            m.CacheFile = d.Val()
+			m.Retries = &n
+		case "cache_file":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.CacheFile = d.Val()
 		case "file":
 			if !d.NextArg() {
 				return d.ArgErr()
