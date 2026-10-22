@@ -7,6 +7,7 @@ import (
     "encoding/hex"
     "encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
     "os"
@@ -29,6 +30,10 @@ func init() {
 type URLIPRange struct {
 	// List of URLs to fetch the IP ranges from.
 	URLs []string `json:"url"`
+	// Local files to read the IP ranges from, in the same format as a URL source.
+	// A file source needs neither TLS nor DNS, so it can be refreshed often
+	// without any network cost.
+	Paths []string `json:"file"`
 	// refresh Interval
 	Interval caddy.Duration `json:"interval,omitempty"`
     // request Timeout
@@ -40,6 +45,11 @@ type URLIPRange struct {
     // Optional path to a cache file. If not set, a file under Caddy's data
     // directory will be used, derived from the URLs.
     CacheFile string `json:"cache_file,omitempty"`
+
+	// AllowEmpty lets a refresh that yields no prefixes replace a non-empty
+	// list. Leave it off: an empty list makes `not dynamic_client_ip` match
+	// everything, so a broken or half-written source would lock every client out.
+	AllowEmpty bool `json:"allow_empty,omitempty"`
 
 	// Holds the parsed CIDR ranges from Ranges.
 	ranges []netip.Prefix
@@ -66,6 +76,40 @@ func (s *URLIPRange) getContext() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(s.ctx, time.Duration(s.Timeout))
 	}
 	return context.WithCancel(s.ctx)
+}
+
+// parsePrefixes reads a list of CIDRs, one per line. Everything after '#' is a
+// comment, matching the format served by the whitelist files.
+func parsePrefixes(r io.Reader) ([]netip.Prefix, error) {
+	scanner := bufio.NewScanner(r)
+	var prefixes []netip.Prefix
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Remove comments from the line
+		if idx := strings.Index(line, "#"); idx != -1 {
+			line = line[:idx]
+		}
+
+		// Trim spaces
+		line = strings.TrimSpace(line)
+
+		// Skip empty lines
+		if line == "" {
+			continue
+		}
+
+		// Convert to prefix
+		prefix, err := caddyhttp.CIDRExpressionToPrefix(line)
+		if err != nil {
+			return nil, err
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return prefixes, nil
 }
 
 func (s *URLIPRange) fetch(api string) ([]netip.Prefix, error) {
@@ -98,42 +142,13 @@ func (s *URLIPRange) fetch(api string) ([]netip.Prefix, error) {
                 lastErr = fmt.Errorf("fetch %s returned HTTP %d", api, resp.StatusCode)
                 cancel()
             } else {
-                scanner := bufio.NewScanner(resp.Body)
-                var prefixes []netip.Prefix
-                for scanner.Scan() {
-                    line := scanner.Text()
-
-                    // Remove comments from the line
-                    if idx := strings.Index(line, "#"); idx != -1 {
-                        line = line[:idx]
-                    }
-
-                    // Trim spaces
-                    line = strings.TrimSpace(line)
-
-                    // Skip empty lines
-                    if line == "" {
-                        continue
-                    }
-
-                    // Convert to prefix
-                    prefix, err := caddyhttp.CIDRExpressionToPrefix(line)
-                    if err != nil {
-                        _ = resp.Body.Close()
-                        cancel()
-                        return nil, err
-                    }
-                    prefixes = append(prefixes, prefix)
-                }
-                // capture scanner error before closing body
-                scanErr := scanner.Err()
+                prefixes, parseErr := parsePrefixes(resp.Body)
                 _ = resp.Body.Close()
                 cancel()
-                if scanErr != nil {
-                    lastErr = scanErr
-                } else {
-                    return prefixes, nil // Success
+                if parseErr != nil {
+                    return nil, parseErr
                 }
+                return prefixes, nil
             }
         }
 
@@ -146,6 +161,21 @@ func (s *URLIPRange) fetch(api string) ([]netip.Prefix, error) {
     return nil, fmt.Errorf("after %d retries: %w", retries, lastErr)
 }
 
+// readFile reads a local list. There is no retry: a missing or unreadable file
+// is a deployment mistake, and the previous list stays in use either way.
+func (s *URLIPRange) readFile(path string) ([]netip.Prefix, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	prefixes, err := parsePrefixes(f)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return prefixes, nil
+}
+
 type cacheFileContents struct {
     Prefixes  []string  `json:"prefixes"`
     UpdatedAt time.Time `json:"updated_at"`
@@ -155,8 +185,14 @@ func (s *URLIPRange) cachePath() (string, error) {
     if s.CacheFile != "" {
         return s.CacheFile, nil
     }
-    // derive from URLs
-    joined := strings.Join(s.URLs, "|")
+    // Derive from every source, so two blocks with different lists never share
+    // a cache file. The "file:" tag keeps paths from colliding with URLs.
+    sources := make([]string, 0, len(s.URLs)+len(s.Paths))
+    sources = append(sources, s.URLs...)
+    for _, p := range s.Paths {
+        sources = append(sources, "file:"+p)
+    }
+    joined := strings.Join(sources, "|")
     sum := sha256.Sum256([]byte(joined))
     name := "ip-list-cache-" + hex.EncodeToString(sum[:]) + ".json"
     dir := caddy.AppDataDir()
@@ -237,6 +273,13 @@ func (s *URLIPRange) getPrefixes() ([]netip.Prefix, error) {
 		}
 		fullPrefixes = append(fullPrefixes, prefixes...)
 	}
+	for _, path := range s.Paths {
+		prefixes, err := s.readFile(path)
+		if err != nil {
+			return nil, err
+		}
+		fullPrefixes = append(fullPrefixes, prefixes...)
+	}
 
 	return fullPrefixes, nil
 }
@@ -282,6 +325,22 @@ func (s *URLIPRange) refresh() {
 			s.log.Warn("failed to refresh IP ranges; keeping existing cache", zap.Error(err))
 		}
 		return
+	}
+
+	// An empty result is almost always a truncated or emptied source, not an
+	// intentional "allow nobody". Keeping the previous list fails open for the
+	// listed clients instead of locking everyone out.
+	if len(fullPrefixes) == 0 && !s.AllowEmpty {
+		s.lock.RLock()
+		had := len(s.ranges) > 0
+		s.lock.RUnlock()
+		if had {
+			if s.log != nil {
+				s.log.Warn("refresh returned no prefixes; keeping the previous list",
+					zap.Int("paths", len(s.Paths)), zap.Int("urls", len(s.URLs)))
+			}
+			return
+		}
 	}
 
 	s.lock.Lock()
@@ -372,6 +431,13 @@ func (m *URLIPRange) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
                 return d.ArgErr()
             }
             m.CacheFile = d.Val()
+		case "file":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.Paths = append(m.Paths, d.Val())
+		case "allow_empty":
+			m.AllowEmpty = true
 		case "url":
 			if !d.NextArg() {
 				return d.ArgErr()

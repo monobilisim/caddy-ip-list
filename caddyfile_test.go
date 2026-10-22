@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -286,5 +287,168 @@ func TestCleanupStopsRefreshLoop(t *testing.T) {
 	// Cleanup must be idempotent
 	if err := r.Cleanup(); err != nil {
 		t.Fatalf("second Cleanup: %v", err)
+	}
+}
+
+// TestFileSourceNoNetwork: a file source is read without any HTTP traffic and
+// its contents are picked up by the background refresh.
+func TestFileSourceNoNetwork(t *testing.T) {
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Write([]byte("198.51.100.0/24\n"))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "mono.txt")
+	if err := os.WriteFile(listPath, []byte("192.0.2.0/24\n# comment\n\n203.0.113.5\n"), 0o644); err != nil {
+		t.Fatalf("write list: %v", err)
+	}
+
+	input := `
+	list {
+	    file ` + listPath + `
+	    interval 100ms
+	}`
+
+	d := caddyfile.NewTestDispenser(input)
+	r := URLIPRange{CacheFile: filepath.Join(dir, "cache.json")}
+	if err := r.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if len(r.Paths) != 1 || r.Paths[0] != listPath {
+		t.Fatalf("file directive not parsed: %v", r.Paths)
+	}
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	start := time.Now()
+	if err := r.Provision(ctx); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+	defer r.Cleanup()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Provision took %v; a file source must not wait on anything", elapsed)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(r.GetIPRanges(nil)) == 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	got := r.GetIPRanges(nil)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 prefixes from file, got %v", got)
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Errorf("file source produced %d HTTP requests, want 0", n)
+	}
+
+	// Rewriting the file must be visible on the next tick, with no reload.
+	if err := os.WriteFile(listPath, []byte("192.0.2.0/24\n"), 0o644); err != nil {
+		t.Fatalf("rewrite list: %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(r.GetIPRanges(nil)) != 1 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := r.GetIPRanges(nil); len(got) != 1 {
+		t.Errorf("file change not picked up: got %v, want 1 prefix", got)
+	}
+}
+
+// TestEmptyRefreshKeepsPreviousList: an emptied source must not wipe a working
+// list, because an empty list makes `not dynamic_client_ip` deny everyone.
+func TestEmptyRefreshKeepsPreviousList(t *testing.T) {
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "list.txt")
+	if err := os.WriteFile(listPath, []byte("192.0.2.0/24\n"), 0o644); err != nil {
+		t.Fatalf("write list: %v", err)
+	}
+
+	d := caddyfile.NewTestDispenser(`
+	list {
+	    file ` + listPath + `
+	    interval 100ms
+	}`)
+	r := URLIPRange{CacheFile: filepath.Join(dir, "cache.json")}
+	if err := r.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	if err := r.Provision(ctx); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+	defer r.Cleanup()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(r.GetIPRanges(nil)) == 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := r.GetIPRanges(nil); len(got) != 1 {
+		t.Fatalf("setup: expected 1 prefix, got %v", got)
+	}
+
+	// truncate the source
+	if err := os.WriteFile(listPath, []byte("\n\n# only comments\n"), 0o644); err != nil {
+		t.Fatalf("truncate list: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if got := r.GetIPRanges(nil); len(got) != 1 {
+		t.Errorf("empty refresh wiped the list: got %v, want the previous prefix kept", got)
+	}
+
+	// with allow_empty the empty list is accepted
+	d2 := caddyfile.NewTestDispenser(`
+	list {
+	    file ` + listPath + `
+	    interval 100ms
+	    allow_empty
+	}`)
+	r2 := URLIPRange{CacheFile: filepath.Join(dir, "cache2.json")}
+	if err := r2.UnmarshalCaddyfile(d2); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if !r2.AllowEmpty {
+		t.Fatal("allow_empty not parsed")
+	}
+	ctx2, cancel2 := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel2()
+	if err := r2.Provision(ctx2); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+	defer r2.Cleanup()
+	if got := r2.GetIPRanges(nil); len(got) != 0 {
+		t.Errorf("allow_empty should accept the empty list, got %v", got)
+	}
+}
+
+// TestCachePathIncludesFiles: two blocks with different file sources must not
+// share a cache file, otherwise one overwrites the other's list.
+func TestCachePathIncludesFiles(t *testing.T) {
+	a := URLIPRange{Paths: []string{"/a/list.txt"}}
+	b := URLIPRange{Paths: []string{"/b/list.txt"}}
+	pa, err := a.cachePath()
+	if err != nil {
+		t.Fatalf("cachePath a: %v", err)
+	}
+	pb, err := b.cachePath()
+	if err != nil {
+		t.Fatalf("cachePath b: %v", err)
+	}
+	if pa == pb {
+		t.Errorf("different file sources share a cache file: %s", pa)
+	}
+
+	// a URL source must not collide with a file source of the same text
+	c := URLIPRange{URLs: []string{"/a/list.txt"}}
+	pc, err := c.cachePath()
+	if err != nil {
+		t.Fatalf("cachePath c: %v", err)
+	}
+	if pc == pa {
+		t.Errorf("URL and file source share a cache file: %s", pa)
 	}
 }

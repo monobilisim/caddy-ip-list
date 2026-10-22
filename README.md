@@ -45,6 +45,21 @@ You can get `dynamic_client_ip` from [here](https://github.com/tuzzmaniandevil/c
 abort @denied
 ```
 
+### Reading a local file instead of a URL
+
+A `file` source is read with no TLS, no DNS and no HTTP round trip, so it can be refreshed much more
+often than a URL. The format is identical to the served list: one CIDR per line, `#` starts a comment.
+
+```caddy
+@denied dynamic_client_ip list {
+    file /srv/whitelist/mono.txt
+    interval 30s
+}
+abort @denied
+```
+
+`url` and `file` may be combined in one block; the prefixes are concatenated.
+
 ### Using `trusted_proxy`
 
 ```caddy
@@ -62,11 +77,13 @@ trusted_proxies list {
 
 | Name     | Description                                      | Type     | Default    |
 | -------- | ------------------------------------------------ | -------- | ---------- |
-| url        | URL(s) to retrieve the IP list                   | string   | *required* |
+| url        | URL(s) to retrieve the IP list                   | string   | *required if no `file`* |
+| file       | Local path(s) to read the IP list from           | string   | none       |
 | interval   | Frequency at which the IP list is retrieved      | duration | 1h         |
 | timeout    | Maximum time to wait for a response from the URL | duration | no timeout |
 | retries    | Maximum number of retries per URL per refresh    | int      | 2          |
 | cache_file | Optional path for persistent cache               | string   | auto       |
+| allow_empty | Accept a refresh that returns no prefixes       | bool     | false      |
 
 ## URL Fetching, Caching, and Startup Behavior
 
@@ -76,6 +93,13 @@ trusted_proxies list {
   immediately; otherwise the first refresh happens at `interval`.
 - When refresh attempts fail, the currently loaded ranges remain in use; once a refresh succeeds, the
   in-memory list and cache are updated.
+- A refresh that succeeds but returns **no prefixes** is ignored while a non-empty list is loaded,
+  unless `allow_empty` is set. In a `not dynamic_client_ip` matcher an empty list matches everyone, so
+  a truncated or emptied source would lock all clients out; keeping the old list fails closed for the
+  source but open for the listed clients. Set `allow_empty` only for a list that is genuinely meant
+  to become empty.
+- The cache file name is derived from every source in the block (URLs and `file` paths), so two blocks
+  with different lists never share a cache file.
 - The refresh loop runs in the background and is stopped when the configuration is unloaded, so repeated
   config loads do not leak goroutines or timers.
 
