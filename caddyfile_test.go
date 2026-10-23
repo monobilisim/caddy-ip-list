@@ -2,11 +2,13 @@ package caddy_ip_list
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -583,5 +585,18 @@ func TestMissingFileStillReported(t *testing.T) {
 	r.lock = new(sync.RWMutex)
 	if !r.fileSourcesChanged() {
 		t.Error("missing file must be treated as changed so the error surfaces")
+	}
+}
+
+// TestNoFileKeyWithoutFiles: an unused file source must not appear in the
+// adapted JSON. A running Caddy from before this field existed rejects the
+// unknown key, so `systemctl reload` fails while the binary is being replaced.
+func TestNoFileKeyWithoutFiles(t *testing.T) {
+	b, err := json.Marshal(URLIPRange{URLs: []string{"https://example.invalid/list.txt"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), `"file"`) {
+		t.Fatalf("config carries an unused file key: %s", b)
 	}
 }

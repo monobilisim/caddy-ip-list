@@ -33,7 +33,9 @@ type URLIPRange struct {
 	// Local files to read the IP ranges from, in the same format as a URL source.
 	// A file source needs neither TLS nor DNS, so it can be refreshed often
 	// without any network cost.
-	Paths []string `json:"file"`
+	// omitempty keeps a nil slice off the wire: an older Caddy process rejects
+	// an unknown "file" key, which would break `systemctl reload` mid-upgrade.
+	Paths []string `json:"file,omitempty"`
 	// refresh Interval
 	Interval caddy.Duration `json:"interval,omitempty"`
 	// request Timeout
