@@ -62,8 +62,12 @@ type URLIPRange struct {
 
 	// Closed by Cleanup to stop the background refresh loop.
 	stop chan struct{}
+	// Waits for the loop goroutine so Cleanup returns only when it stopped.
+	// Pointer because CaddyModule copies the struct by value.
+	wg *sync.WaitGroup
 	// Guards a second Cleanup, which would close an already closed channel.
-	cleanupOnce sync.Once
+	// Pointer because CaddyModule copies the struct by value.
+	cleanupOnce *sync.Once
 	// Fingerprint of the file sources as of the last refresh. A low interval is
 	// cheap only if an unchanged file costs a stat and nothing else.
 	lastFiles string
@@ -301,6 +305,9 @@ func (s *URLIPRange) getPrefixes() ([]netip.Prefix, error) {
 func (s *URLIPRange) Provision(ctx caddy.Context) error {
 	s.ctx = ctx
 	s.lock = new(sync.RWMutex)
+	s.wg = new(sync.WaitGroup)
+	s.cleanupOnce = new(sync.Once)
+
 	s.log = ctx.Logger()
 	stop := make(chan struct{})
 	s.stop = stop
@@ -318,6 +325,7 @@ func (s *URLIPRange) Provision(ctx caddy.Context) error {
 
 	// Refresh in the background: immediately on a cold start (no cache),
 	// otherwise at the first tick.
+	s.wg.Add(1)
 	go s.refreshLoop(stop, cacheErr != nil)
 	return nil
 }
@@ -330,6 +338,7 @@ func (s *URLIPRange) Cleanup() error {
 		if s.stop != nil {
 			close(s.stop)
 		}
+		s.wg.Wait()
 	})
 	return nil
 }
@@ -401,9 +410,15 @@ func (s *URLIPRange) refresh() {
 }
 
 func (s *URLIPRange) refreshLoop(stop <-chan struct{}, refreshNow bool) {
+	defer s.wg.Done()
 	interval := time.Hour
 	if s.Interval > 0 {
 		interval = time.Duration(s.Interval)
+	}
+	// File-only sources need no pacing: an unchanged file costs one stat, so
+	// a long interval only delays picking up an update written by CI.
+	if len(s.URLs) == 0 && len(s.Paths) > 0 && interval > 15*time.Second {
+		interval = 15 * time.Second
 	}
 
 	if refreshNow {
