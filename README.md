@@ -128,7 +128,7 @@ trusted_proxies list {
 |---|---|---|---|
 | `url` | URL(s) to retrieve the IP list from | string | required if no `file` |
 | `file` | Local path(s) to read the IP list from | string | none |
-| `interval` | Frequency at which the list is refreshed | duration | `1h` |
+| `interval` | Frequency at which the list is refreshed (capped at `15s` for file-only blocks) | duration | `1h` |
 | `timeout` | Maximum time to wait for a response from a URL | duration | no timeout |
 | `retries` | Retries per URL per refresh (`0` disables) | int | `2` |
 | `cache_file` | Path for the persistent cache | string | derived from the sources |
@@ -146,6 +146,9 @@ trusted_proxies list {
   refresh is discarded while a non-empty list is loaded. Set `allow_empty` only for a list that is genuinely
   meant to become empty.
 - **Short intervals are cheap for files.** An unchanged file is detected with `stat` and skipped.
+- **File-only blocks ignore long intervals.** When a block has `file` sources and no `url`, `interval` is
+  capped at 15s: an unchanged file costs one `stat`, so a 6h interval would only delay picking up a list
+  written by CI. Blocks that fetch over the network keep the configured interval.
 - **No leaks.** The refresh loop stops when the configuration is unloaded, so repeated config loads do not
   accumulate goroutines or timers.
 - **Cold start.** Without a usable cache, matchers see an empty list until the first background refresh
